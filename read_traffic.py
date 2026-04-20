@@ -1,439 +1,360 @@
-#!/usr/bin/env python3
-import json
-import os
-import re
-import subprocess
-import sys
 import time
+import csv
+import os
+import subprocess
+import json
+import sys
 import uuid
-from dataclasses import dataclass
-from datetime import datetime, timezone
-from pathlib import Path
-from typing import Optional
-from urllib import error, request
+import paho.mqtt.client as mqtt
+from paho.mqtt.enums import CallbackAPIVersion # Thêm dòng này
+from routeros_api import RouterOsApiPool
 
-try:
-    import paho.mqtt.client as mqtt
-    from paho.mqtt.enums import CallbackAPIVersion
-except ImportError:
-    print("Missing dependency: paho-mqtt", file=sys.stderr)
-    print("Install it with: sudo apt install -y python3-paho-mqtt", file=sys.stderr)
-    sys.exit(1)
+# ──────────────────────────────────────────────────────────────────────────────
+# THÔNG SỐ KẾT NỐI
+# ──────────────────────────────────────────────────────────────────────────────
+MK_IP       = os.environ.get("MK_IP",       "192.168.40.1")
+MK_USER     = os.environ.get("MK_USER",     "admin")
+MK_PASS     = os.environ.get("MK_PASS",     "123")
+MQTT_BROKER = os.environ.get("MQTT_BROKER", "192.168.40.252")
+MQTT_PORT   = int(os.environ.get("MQTT_PORT", "1883"))
 
-try:
-    from routeros_api import RouterOsApiPool
-except ImportError:
-    print("Missing dependency: RouterOS-api", file=sys.stderr)
-    print("Install it with: python3 -m pip install RouterOS-api", file=sys.stderr)
-    sys.exit(1)
+# ── Identity (phải khớp với tenant/vessel/edge đã seed trên server) ───────────
+TENANT_CODE = os.environ.get("TENANT_CODE", "tenant-01")
+VESSEL_CODE = os.environ.get("VESSEL_CODE", "vessel-01")
+EDGE_CODE   = os.environ.get("EDGE_CODE",   "remote_01")
 
+# ── MQTT topic prefix ─────────────────────────────────────────────────────────
+_PREFIX         = f"mcu/{TENANT_CODE}/{VESSEL_CODE}/{EDGE_CODE}"
+TOPIC_TELEMETRY = f"{_PREFIX}/telemetry"
+TOPIC_HEARTBEAT = f"{_PREFIX}/heartbeat"
+TOPIC_ACK       = f"{_PREFIX}/ack"
+TOPIC_RESULT    = f"{_PREFIX}/result"
+TOPIC_EVENT     = f"{_PREFIX}/event"
+TOPIC_COMMAND   = f"{_PREFIX}/command"   # subscribe
 
-ENV_FILE = Path(__file__).with_suffix(".env")
-PING_RTT_RE = re.compile(r"=\s*([\d.]+)/([\d.]+)/([\d.]+)/([\d.]+)\s*ms")
-PING_LOSS_RE = re.compile(r"(\d+(?:\.\d+)?)%\s*packet loss")
-
-# Giữ nguyên mapping port từ read_traffic.py
-DEFAULT_WATCH_PORTS = {
-    "ether1-Starlink": "P1-STARLINK",
-    "ether2-VSAT": "P2-VSAT",
-    "ether3-LTE": "P3-LTE",
-    "ether4-MCU": "P4-MCU",
-    "ether5-USER": "P5-USER",
+WATCH_PORTS = {
+    'ether1-Starlink': 'P1-STARLINK',
+    'ether2-VSAT':     'P2-VSAT',
+    'ether3-LTE':      'P3-LTE',
+    'ether4-MCU':      'P4-MCU',
+    'ether5-USER':     'P5-USER'
 }
-DEFAULT_WAN_PRIORITY = ["ether1-Starlink", "ether2-VSAT", "ether3-LTE"]
 
+BASE_DIR          = os.path.dirname(os.path.abspath(__file__))
+LOG_FILE          = os.path.join(BASE_DIR, "traffic_log.csv")
+POLICY_SCRIPT     = os.path.join(BASE_DIR, "routeros_policy.py")
+COMMAND_HOOK      = os.environ.get("COMMAND_HOOK", "")
+TELEMETRY_INTERVAL = int(os.environ.get("TELEMETRY_INTERVAL", "5"))
 
-def load_env_file(path: Path) -> None:
-    if not path.exists():
-        return
-    for raw_line in path.read_text(encoding="utf-8").splitlines():
-        line = raw_line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        key, value = line.split("=", 1)
-        os.environ.setdefault(key.strip(), value.strip().strip("'").strip('"'))
+# ──────────────────────────────────────────────────────────────────────────────
+# MQTT CLIENT
+# ──────────────────────────────────────────────────────────────────────────────
+client = mqtt.Client(CallbackAPIVersion.VERSION2)
 
+# ──────────────────────────────────────────────────────────────────────────────
+# ENVELOPE (theo MQTT contract v1 của backend)
+# ──────────────────────────────────────────────────────────────────────────────
+def make_envelope(payload: dict) -> str:
+    return json.dumps({
+        "msg_id":         str(uuid.uuid4()),
+        "schema_version": "v1",
+        "timestamp":      time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
+        "payload":        payload
+    })
 
-def env_text(name: str, default: Optional[str] = None) -> str:
-    value = os.getenv(name, default)
-    return value or ""
+# ──────────────────────────────────────────────────────────────────────────────
+# XỬ LÝ COMMAND TỪ SERVER
+# ──────────────────────────────────────────────────────────────────────────────
+def publish_ack(job_id: str):
+    ack_payload = make_envelope({
+        "command_job_id": job_id,
+        "status":         "ack",
+        "message":        "Command received by MCU"
+    })
+    client.publish(TOPIC_ACK, ack_payload, qos=1)
+    print(f"[MCU] ACK sent for job_id={job_id}")
 
+def publish_result(job_id: str, success: bool, message: str = "", result_payload: dict = None):
+    body = {
+        "command_job_id": job_id,
+        "status":         "success" if success else "failed",
+        "message":        message,
+    }
+    if result_payload:
+        body["result_payload"] = result_payload
+    client.publish(TOPIC_RESULT, make_envelope(body), qos=1)
+    print(f"[MCU] RESULT sent job_id={job_id} status={'success' if success else 'failed'}")
 
-def env_int(name: str, default: int) -> int:
+def publish_event(event_type: str, severity: str, details: dict = None):
+    body = {
+        "event_type": event_type,
+        "severity":   severity,
+        "details":    details or {}
+    }
+    client.publish(TOPIC_EVENT, make_envelope(body), qos=1)
+    print(f"[MCU] EVENT sent type={event_type} severity={severity}")
+
+def run_policy_sync(groups: list = None) -> tuple:
+    if not os.path.exists(POLICY_SCRIPT):
+        return False, f"routeros_policy.py không tìm thấy tại {POLICY_SCRIPT}"
     try:
-        return int(os.getenv(name, str(default)))
-    except ValueError:
-        return default
-
-
-def env_float(name: str, default: float) -> float:
-    try:
-        return float(os.getenv(name, str(default)))
-    except ValueError:
-        return default
-
-
-def env_json(name: str, default):
-    raw = os.getenv(name, "").strip()
-    if not raw:
-        return default
-    return json.loads(raw)
-
-
-def env_csv(name: str, default: list[str]) -> list[str]:
-    raw = os.getenv(name, "").strip()
-    if not raw:
-        return default
-    return [item.strip() for item in raw.split(",") if item.strip()]
-
-
-def now_iso() -> str:
-    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
-
-
-def post_json(url: str, payload: dict, timeout_seconds: float = 10.0) -> dict:
-    try:
-        body = json.dumps(payload).encode("utf-8")
-        req = request.Request(
-            url,
-            data=body,
-            headers={"content-type": "application/json; charset=utf-8"},
-            method="POST",
-        )
-        with request.urlopen(req, timeout=timeout_seconds) as response:
-            content = response.read().decode("utf-8")
-            return json.loads(content) if content else {}
+        if groups is not None:
+            # Policy động từ server: truyền qua stdin
+            completed = subprocess.run(
+                [sys.executable, POLICY_SCRIPT, "--stdin-apply"],
+                input=json.dumps(groups),
+                capture_output=True, text=True,
+                check=False, timeout=120
+            )
+        else:
+            # Fallback: dùng cấu hình mặc định bên trong script
+            completed = subprocess.run(
+                [sys.executable, POLICY_SCRIPT, "--apply"],
+                capture_output=True, text=True,
+                check=False, timeout=120
+            )
+        success = (completed.returncode == 0)
+        output  = (completed.stdout + completed.stderr).strip()
+        print(f"[policy] returncode={completed.returncode}\n{output}")
+        return success, output
+    except subprocess.TimeoutExpired:
+        return False, "routeros_policy.py timeout sau 120s"
     except Exception as e:
-        return {"error": str(e)}
+        return False, str(e)
 
-
-def measure_ping(target: str, packets: int, timeout_seconds: int) -> tuple[Optional[float], Optional[float], Optional[float]]:
-    command = ["ping", "-c", str(max(1, packets)), "-W", str(max(1, timeout_seconds)), target]
+def run_command_hook(command_type: str, command_payload: dict) -> tuple:
+    if not COMMAND_HOOK or not os.path.exists(COMMAND_HOOK):
+        msg = f"COMMAND_HOOK không được cấu hình hoặc không tồn tại: '{COMMAND_HOOK}'"
+        print(f"[MCU] WARNING: {msg}")
+        return False, msg
+    env = os.environ.copy()
+    env["MCU_COMMAND_TYPE"]    = command_type
+    env["MCU_COMMAND_PAYLOAD"] = json.dumps(command_payload)
+    env["MK_IP"]               = MK_IP
+    env["MK_USER"]             = MK_USER
+    env["MK_PASS"]             = MK_PASS
     try:
-        result = subprocess.run(
-            command,
-            capture_output=True,
-            text=True,
-            check=False,
-            timeout=timeout_seconds + packets + 2,
+        completed = subprocess.run(
+            ["/bin/bash", COMMAND_HOOK],
+            capture_output=True, text=True,
+            check=False, timeout=60, env=env
         )
-    except Exception:
-        return None, None, None
+        success = (completed.returncode == 0)
+        output  = (completed.stdout + completed.stderr).strip()
+        print(f"[hook] {command_type} returncode={completed.returncode}\n{output}")
+        return success, output
+    except subprocess.TimeoutExpired:
+        return False, f"{COMMAND_HOOK} timeout sau 60s"
+    except Exception as e:
+        return False, str(e)
 
-    stdout = result.stdout or ""
-    loss_match = PING_LOSS_RE.search(stdout)
-    rtt_match = PING_RTT_RE.search(stdout)
-    loss_pct = float(loss_match.group(1)) if loss_match else (100.0 if result.returncode else 0.0)
-    if not rtt_match:
-        return None, round(loss_pct, 3), None
+def execute_command(raw_message: str):
+    try:
+        envelope = json.loads(raw_message)
+    except json.JSONDecodeError as e:
+        print(f"[MCU] WARNING command JSON parse error: {e}")
+        return
 
-    latency_ms = float(rtt_match.group(2))
-    jitter_ms = float(rtt_match.group(4))
-    return round(latency_ms, 2), round(loss_pct, 3), round(jitter_ms, 2)
+    job_id = (
+        envelope.get("msg_id")
+        or envelope.get("payload", {}).get("command_job_id")
+        or str(uuid.uuid4())
+    )
 
+    publish_ack(job_id)
 
-@dataclass
-class InterfaceCounters:
-    name: str
-    running: bool
-    rx_bytes: int
-    tx_bytes: int
+    payload      = envelope.get("payload", envelope)
+    command_type = payload.get("command_type", "")
+    cmd_payload  = payload.get("command_payload", {}) or {}
 
+    print(f"[MCU] Executing command type={command_type} job_id={job_id}")
 
-@dataclass
-class TelemetryInterface:
-    name: str
-    running: bool
-    rx_kbps: float
-    tx_kbps: float
-    throughput_kbps: float
-    total_gb: float
-
-
-class RouterOsTrafficTracker:
-    def __init__(self, api, watch_ports: dict[str, str]) -> None:
-        self.interface_resource = api.get_resource("/interface")
-        self.system_resource = api.get_resource("/system/resource")
-        self.watch_ports = watch_ports
-        self.previous_snapshot: Optional[dict[str, InterfaceCounters]] = None
-        self.previous_timestamp: Optional[float] = None
-
-    def read_system_resource(self) -> tuple[Optional[float], Optional[float], Optional[str]]:
-        try:
-            rows = self.system_resource.get()
-        except Exception:
-            return None, None, None
-        if not rows:
-            return None, None, None
-
-        row = rows[0]
-        cpu_usage_pct = self._as_float(row.get("cpu-load"))
-        free_memory = self._as_float(row.get("free-memory"))
-        total_memory = self._as_float(row.get("total-memory"))
-        ram_usage_pct = None
-        if total_memory and total_memory > 0 and free_memory is not None:
-            ram_usage_pct = round(((total_memory - free_memory) / total_memory) * 100.0, 2)
-        return cpu_usage_pct, ram_usage_pct, row.get("version")
-
-    def sample(self) -> list[TelemetryInterface]:
-        current_snapshot = self._read_interfaces()
-        current_timestamp = time.monotonic()
-        previous_snapshot = self.previous_snapshot
-        previous_timestamp = self.previous_timestamp
-        self.previous_snapshot = current_snapshot
-        self.previous_timestamp = current_timestamp
-
-        if not previous_snapshot or previous_timestamp is None:
-            return []
-
-        interval = current_timestamp - previous_timestamp
-        if interval <= 0:
-            return []
-
-        samples: list[TelemetryInterface] = []
-        for name, current in current_snapshot.items():
-            previous = previous_snapshot.get(name)
-            if not previous:
-                continue
-
-            rx_delta = max(0, current.rx_bytes - previous.rx_bytes)
-            tx_delta = max(0, current.tx_bytes - previous.tx_bytes)
-            rx_kbps = round((rx_delta * 8.0) / interval / 1000.0, 2)
-            tx_kbps = round((tx_delta * 8.0) / interval / 1000.0, 2)
-            samples.append(
-                TelemetryInterface(
-                    name=name,
-                    running=current.running,
-                    rx_kbps=rx_kbps,
-                    tx_kbps=tx_kbps,
-                    throughput_kbps=round(rx_kbps + tx_kbps, 2),
-                    total_gb=round((current.rx_bytes + current.tx_bytes) / (1024.0 ** 3), 3),
-                )
-            )
-        return samples
-
-    def _read_interfaces(self) -> dict[str, InterfaceCounters]:
-        interfaces = {}
-        for iface in self.interface_resource.get():
-            name = iface.get("name")
-            if name not in self.watch_ports:
-                continue
-            interfaces[name] = InterfaceCounters(
-                name=name,
-                running=iface.get("running") == "true",
-                rx_bytes=int(iface.get("rx-byte", 0)),
-                tx_bytes=int(iface.get("tx-byte", 0)),
-            )
-        return interfaces
-
-    @staticmethod
-    def _as_float(value) -> Optional[float]:
-        try:
-            if value is None or value == "":
-                return None
-            return float(value)
-        except (TypeError, ValueError):
-            return None
-
-
-class BackendCompatibleMcu:
-    def __init__(self) -> None:
-        load_env_file(ENV_FILE)
-
-        # Mặc định lấy từ thông số của file read_traffic.py cũ
-        self.mqtt_host = env_text("BACKEND_MQTT_HOST", "192.168.40.252")
-        self.mqtt_port = env_int("BACKEND_MQTT_PORT", 1883)
-        self.mqtt_username = env_text("BACKEND_MQTT_USERNAME", "")
-        self.mqtt_password = env_text("BACKEND_MQTT_PASSWORD", "")
-        
-        self.tenant_code = env_text("TENANT_CODE", "tnr13")
-        self.vessel_code = env_text("VESSEL_CODE", "vsl-001")
-        self.edge_code = env_text("EDGE_CODE", "edge-001")
-        
-        self.backend_api_url = env_text("BACKEND_API_URL", f"http://{self.mqtt_host}:8080").rstrip("/")
-        self.firmware_version = env_text("FIRMWARE_VERSION", "routeros-uplink-1.0.0")
-        
-        self.mk_ip = env_text("MK_IP", "10.0.0.1")
-        self.mk_user = env_text("MK_USER", "admin")
-        self.mk_pass = env_text("MK_PASS", "123")
-        
-        self.heartbeat_interval = env_float("HEARTBEAT_INTERVAL_SECONDS", 15.0)
-        self.telemetry_interval = env_float("TELEMETRY_INTERVAL_SECONDS", 1.0) # Đặt thành 1.0 giây như read_traffic.py
-        self.register_interval = env_float("REGISTER_INTERVAL_SECONDS", 300.0)
-        
-        self.ping_target = env_text("PING_TARGET", "8.8.8.8")
-        self.ping_packets = env_int("PING_PACKETS", 1)
-        self.ping_timeout_seconds = env_int("PING_TIMEOUT_SECONDS", 1)
-        
-        self.watch_ports = env_json("WATCH_PORTS_JSON", DEFAULT_WATCH_PORTS)
-        self.wan_priority = env_csv("WAN_PRIORITY", DEFAULT_WAN_PRIORITY)
-
-        self.register_url = f"{self.backend_api_url}/api/mcu/register"
-        self.base_topic = f"mcu/{self.tenant_code}/{self.vessel_code}/{self.edge_code}"
-        self.api_pool = None
-        self.tracker: Optional[RouterOsTrafficTracker] = None
-
-        self.mqtt_client = mqtt.Client(
-            CallbackAPIVersion.VERSION2,
-            client_id=f"{self.edge_code}-{uuid.uuid4().hex[:8]}",
-            clean_session=True,
+    if command_type == "policy_sync":
+        groups = cmd_payload.get("groups") if isinstance(cmd_payload, dict) else None
+        success, output = run_policy_sync(groups=groups)
+        publish_result(
+            job_id, success,
+            message=output[:500],
+            result_payload={"groups_count": len(groups) if groups else 0}
         )
-        if self.mqtt_username:
-            self.mqtt_client.username_pw_set(self.mqtt_username, self.mqtt_password or None)
+        if not success:
+            publish_event("policy_error", "warning", {"command_type": command_type, "detail": output[:200]})
 
-    def connect(self) -> None:
-        try:
-            self.mqtt_client.connect(self.mqtt_host, self.mqtt_port, keepalive=60)
-            self.mqtt_client.loop_start()
-        except:
-            pass # Lỗi sẽ hiển thị Hub OFFLINE ở phần giao diện
-            
-        self.api_pool = RouterOsApiPool(
-            self.mk_ip,
-            username=self.mk_user,
-            password=self.mk_pass,
-            plaintext_login=True,
-        )
-        self.tracker = RouterOsTrafficTracker(self.api_pool.get_api(), self.watch_ports)
+    elif command_type in ("failover_starlink", "failback_vsat", "restore_automatic"):
+        success, output = run_command_hook(command_type, cmd_payload)
+        publish_result(job_id, success, message=output[:500])
 
-    def disconnect(self) -> None:
-        try:
-            self.mqtt_client.loop_stop()
-            self.mqtt_client.disconnect()
-        except Exception:
-            pass
-        if self.api_pool:
-            try:
-                self.api_pool.disconnect()
-            except Exception:
-                pass
-        self.api_pool = None
-        self.tracker = None
+    else:
+        msg = f"Unknown command_type: '{command_type}'"
+        print(f"[MCU] WARNING {msg}")
+        publish_result(job_id, False, message=msg)
 
-    def register(self) -> None:
-        post_json(
-            self.register_url,
-            {
-                "tenant_code": self.tenant_code,
-                "vessel_code": self.vessel_code,
-                "edge_code": self.edge_code,
-                "firmware_version": self.firmware_version,
-            },
-        )
+# ──────────────────────────────────────────────────────────────────────────────
+# MQTT CALLBACKS
+# ──────────────────────────────────────────────────────────────────────────────
+def on_connect(client_ref, userdata, flags, reason_code, properties):
+    if reason_code == 0:
+        print(f"[MCU] MQTT connected to {MQTT_BROKER}:{MQTT_PORT}")
+        client_ref.subscribe(TOPIC_COMMAND, qos=1)
+        print(f"[MCU] Subscribed to {TOPIC_COMMAND}")
+    else:
+        print(f"[MCU] WARNING MQTT connect failed: reason_code={reason_code}")
 
-    def publish(self, channel: str, payload: dict) -> None:
-        message = {
-            "msg_id": str(uuid.uuid4()),
-            "timestamp": now_iso(),
-            "tenant_id": self.tenant_code,
-            "vessel_id": self.vessel_code,
-            "edge_id": self.edge_code,
-            "schema_version": "v1",
-            "payload": payload,
-        }
-        self.mqtt_client.publish(f"{self.base_topic}/{channel}", json.dumps(message), qos=1)
+def on_disconnect(client_ref, userdata, flags, reason_code, properties):
+    print(f"[MCU] WARNING MQTT disconnected reason_code={reason_code}, se tu reconnect...")
 
-    def choose_active_uplink(self, interfaces: list[TelemetryInterface]) -> Optional[TelemetryInterface]:
-        by_name = {iface.name: iface for iface in interfaces}
-        for name in self.wan_priority:
-            iface = by_name.get(name)
-            if iface and iface.running and iface.throughput_kbps > 0:
-                return iface
-        running = [iface for iface in interfaces if iface.running]
-        if running:
-            return max(running, key=lambda item: item.throughput_kbps)
-        return interfaces[0] if interfaces else None
+def on_message(client_ref, userdata, msg):
+    print(f"[MCU] Command received on {msg.topic}")
+    try:
+        execute_command(msg.payload.decode("utf-8"))
+    except Exception as e:
+        print(f"[MCU] WARNING Error processing command: {e}")
 
-    def run(self) -> None:
-        self.connect()
-        last_register_at = 0.0
-        last_heartbeat_at = 0.0
-        last_telemetry_at = 0.0
+# ──────────────────────────────────────────────────────────────────────────────
+# KẾT NỐI MQTT
+# ──────────────────────────────────────────────────────────────────────────────
+def connect_mqtt() -> bool:
+    client.on_connect    = on_connect
+    client.on_disconnect = on_disconnect
+    client.on_message    = on_message
+    try:
+        client.connect(MQTT_BROKER, MQTT_PORT, keepalive=60)
+        client.loop_start()
+        return True
+    except Exception as e:
+        print(f"[MCU] WARNING MQTT connect error: {e}")
+        return False
+
+# ──────────────────────────────────────────────────────────────────────────────
+# PING CHECK (giữ nguyên logic cũ)
+# ──────────────────────────────────────────────────────────────────────────────
+def ping_check(host):
+    try:
+        output = subprocess.run(['ping', '-c', '1', '-W', '0.8', host],
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        return "ONLINE" if output.returncode == 0 else "OFFLINE"
+    except:
+        return "ERROR"
+
+# ──────────────────────────────────────────────────────────────────────────────
+# VÒNG LẶP CHÍNH
+# ──────────────────────────────────────────────────────────────────────────────
+def monitor():
+    mqtt_ok = connect_mqtt()
+    if not mqtt_ok:
+        print("[MCU] WARNING MQTT Broker Offline. Script van chay nhung khong gui duoc du lieu ve Hub.")
+
+    # Gửi heartbeat ban đầu
+    if mqtt_ok:
+        hb = make_envelope({
+            "status":           "online",
+            "firmware_version": "MCU-v2.0",
+            "cpu_usage_pct":    None,
+            "ram_usage_pct":    None,
+            "public_wan_ip":    None
+        })
+        client.publish(TOPIC_HEARTBEAT, hb, qos=1)
+        print("[MCU] Heartbeat sent (startup)")
+
+    try:
+        api_pool = RouterOsApiPool(MK_IP, username=MK_USER, password=MK_PASS, plaintext_login=True)
+        api = api_pool.get_api()
+        res_iface = api.get_resource('/interface')
+
+        prev_data = {i['name']: i for i in res_iface.get() if i['name'] in WATCH_PORTS}
+        prev_time = time.time()
 
         while True:
+            time.sleep(TELEMETRY_INTERVAL)
+            curr_time = time.time()
+            interval  = curr_time - prev_time
+            timestamp = time.strftime('%H:%M:%S')
+
+            net_stat = ping_check("8.8.8.8")
+            be_stat  = ping_check(MQTT_BROKER)
+
             try:
-                if not self.tracker:
-                    raise RuntimeError("tracker_unavailable")
+                current_data = {i['name']: i for i in res_iface.get() if i['name'] in WATCH_PORTS}
+            except:
+                continue
 
-                now = time.monotonic()
-                if now - last_register_at >= self.register_interval:
-                    self.register()
-                    last_register_at = now
+            interfaces    = []
+            active_uplink = None
+            total_rx_kbps = 0.0
+            total_tx_kbps = 0.0
 
-                cpu_usage_pct, ram_usage_pct, firmware_version = self.tracker.read_system_resource()
-                if now - last_heartbeat_at >= self.heartbeat_interval:
-                    self.publish(
-                        "heartbeat",
-                        {
-                            "firmware_version": firmware_version or self.firmware_version,
-                            "cpu_usage_pct": cpu_usage_pct,
-                            "ram_usage_pct": ram_usage_pct,
-                            "status": "online",
-                        },
-                    )
-                    last_heartbeat_at = now
+            print(f"\n📅 {time.strftime('%Y-%m-%d')} | 🕒 {timestamp}")
+            print(f"📡 INTERNET: {net_stat} | 🔗 HUB VPN: {be_stat}")
+            print("=" * 82)
+            print(f"{'PORT':<12} | {'STATUS':<10} | {'TRAFFIC (kbps)':^26} | {'TOTAL (MB)':>12}")
+            print("-" * 82)
 
-                interfaces = self.tracker.sample()
-                if interfaces and now - last_telemetry_at >= self.telemetry_interval:
-                    active = self.choose_active_uplink(interfaces)
-                    
-                    # Kiểm tra trạng thái Internet và VPN (tương tự bản cũ)
-                    latency_ms, loss_pct, jitter_ms = measure_ping(self.ping_target, self.ping_packets, self.ping_timeout_seconds)
-                    be_latency, be_loss, _ = measure_ping(self.mqtt_host, self.ping_packets, self.ping_timeout_seconds)
-                    
-                    net_stat = "ONLINE" if loss_pct is not None and loss_pct < 100 else "OFFLINE"
-                    be_stat  = "ONLINE" if be_loss is not None and be_loss < 100 else "OFFLINE"
-                    
-                    # --- GIAO DIỆN BẢNG ASCII (Từ read_traffic.py) ---
-                    timestamp = time.strftime('%H:%M:%S')
-                    print(f"\n📅 {time.strftime('%Y-%m-%d')} | 🕒 {timestamp}")
-                    print(f"📡 INTERNET: {net_stat} | 🔗 HUB VPN: {be_stat}")
-                    print("=" * 82)
-                    print(f"{'PORT':<12} | {'STATUS':<10} | {'TRAFFIC (kbps)':^26} | {'TOTAL (MB)':>12}")
-                    print("-" * 82)
+            for name, label in WATCH_PORTS.items():
+                if name not in current_data:
+                    continue
 
-                    payload_data = []
-                    for iface in interfaces:
-                        label = self.watch_ports.get(iface.name, iface.name)
-                        is_up = iface.running
-                        status_str = "✅ UP" if is_up else "❌ DOWN"
-                        
-                        kbps_in = iface.rx_kbps
-                        kbps_out = iface.tx_kbps
-                        total_mb = iface.total_gb * 1024 # Chuyển GB sang MB để hiển thị giống bản cũ
-                        
-                        traffic = f"⬇ {kbps_in:>8.1f} | ⬆ {kbps_out:>8.1f}"
-                        print(f"{label:<12} | {status_str:<10} | {traffic} | {total_mb:>10.2f} MB")
-                        
-                        # Data chuẩn bị để gửi MQTT
-                        payload_data.append({
-                            "p": label, "s": status_str, "in": round(kbps_in,1), "out": round(kbps_out,1), "t": round(total_mb,2)
-                        })
+                iface  = current_data[name]
+                is_up  = iface.get('running') == 'true'
+                status_str = "✅ UP" if is_up else "❌ DOWN"
 
-                    # --- GỬI TELEMETRY QUA MQTT ---
-                    self.publish(
-                        "telemetry",
-                        {
-                            "active_uplink": active.name if active else None,
-                            "latency_ms": latency_ms,
-                            "loss_pct": loss_pct,
-                            "jitter_ms": jitter_ms,
-                            "data": payload_data # Bao gồm data các port chi tiết
-                        },
-                    )
-                    last_telemetry_at = now
+                curr_rx = int(iface.get('rx-byte', 0))
+                curr_tx = int(iface.get('tx-byte', 0))
+                prev_rx = int(prev_data.get(name, {}).get('rx-byte', 0))
+                prev_tx = int(prev_data.get(name, {}).get('tx-byte', 0))
 
-                time.sleep(1)
-            except error.URLError:
-                time.sleep(5)
-            except KeyboardInterrupt:
-                print("\n👋 Stopped.")
-                break
-            except Exception as exc:
-                print(f"❌ Error: {exc}")
-                time.sleep(5)
+                kbps_in  = ((curr_rx - prev_rx) * 8) / (1024 * interval)
+                kbps_out = ((curr_tx - prev_tx) * 8) / (1024 * interval)
+                total_mb = (curr_rx + curr_tx) / (1024 * 1024)
+                total_gb = (curr_rx + curr_tx) / (1024 * 1024 * 1024)
 
-        self.disconnect()
+                # Đưa vào payload MQTT (giữ nguyên format cũ để in terminal)
+                traffic = f"⬇ {kbps_in:>8.1f} | ⬆ {kbps_out:>8.1f}"
+                print(f"{label:<12} | {status_str:<10} | {traffic} | {total_mb:>10.2f} MB")
+
+                # Contract v1: interfaces[]
+                interfaces.append({
+                    "name":            name,
+                    "status":          "up" if is_up else "down",
+                    "rx_kbps":         round(kbps_in,  1),
+                    "tx_kbps":         round(kbps_out, 1),
+                    "throughput_kbps": round(kbps_in + kbps_out, 1),
+                    "total_gb":        round(total_gb, 6)
+                })
+
+                total_rx_kbps += kbps_in
+                total_tx_kbps += kbps_out
+
+                if is_up and active_uplink is None and name not in ('ether4-MCU', 'ether5-USER'):
+                    active_uplink = name
+
+            # Gửi telemetry theo contract v1
+            telemetry_body = {
+                "active_uplink":   active_uplink,
+                "latency_ms":      None,
+                "loss_pct":        0.0 if net_stat == "ONLINE" else 100.0,
+                "jitter_ms":       None,
+                "rx_kbps":         round(total_rx_kbps, 1),
+                "tx_kbps":         round(total_tx_kbps, 1),
+                "throughput_kbps": round(total_rx_kbps + total_tx_kbps, 1),
+                "public_wan_ip":   None,
+                "internet":        net_stat,
+                "hub_vpn":         be_stat,
+                "interfaces":      interfaces,
+            }
+
+            if mqtt_ok:
+                client.publish(TOPIC_TELEMETRY, make_envelope(telemetry_body), qos=0)
+
+            prev_data, prev_time = current_data, curr_time
+
+    except KeyboardInterrupt:
+        print("\n👋 Stopped.")
+        client.loop_stop()
+    except Exception as e:
+        print(f"❌ Error: {e}")
+    finally:
+        if 'api_pool' in locals():
+            api_pool.disconnect()
 
 if __name__ == "__main__":
-    BackendCompatibleMcu().run()
+    monitor()
